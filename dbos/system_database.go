@@ -1039,7 +1039,7 @@ func (s *systemDatabase) Send(ctx context.Context, input WorkflowSendInput) erro
 
 	// Check if operation was already executed and do nothing if so
 	checkInput := CheckOperationExecutionDBInput{
-		workflowID:   input.DestinationID,
+		workflowID:   workflowState.WorkflowID,
 		operationID:  stepID,
 		functionName: functionName,
 		tx:           tx,
