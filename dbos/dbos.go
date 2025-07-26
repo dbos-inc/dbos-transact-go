@@ -3,14 +3,13 @@ package dbos
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/gob"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
-	"reflect"
-	"runtime"
-	"sort"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -22,36 +21,6 @@ var (
 	_APP_ID                    string
 	_DEFAULT_ADMIN_SERVER_PORT = 3001
 )
-
-func computeApplicationVersion() string {
-	if len(registry) == 0 {
-		fmt.Println("DBOS: No registered workflows found, cannot compute application version")
-		return ""
-	}
-
-	// Collect all function names and sort them for consistent hashing
-	var functionNames []string
-	for fqn := range registry {
-		functionNames = append(functionNames, fqn)
-	}
-	sort.Strings(functionNames)
-
-	hasher := sha256.New()
-
-	for _, fqn := range functionNames {
-		workflowEntry := registry[fqn]
-
-		// Try to get function source location and other identifying info
-		if pc := runtime.FuncForPC(reflect.ValueOf(workflowEntry.wrappedFunction).Pointer()); pc != nil {
-			// Get the function's entry point - this reflects the actual compiled code
-			entry := pc.Entry()
-			fmt.Fprintf(hasher, "%x", entry)
-		}
-	}
-
-	return hex.EncodeToString(hasher.Sum(nil))
-
-}
 
 var workflowScheduler *cron.Cron // Global because accessed during workflow registration before the dbos singleton is initialized
 
@@ -140,6 +109,10 @@ func Initialize(inputConfig Config) error {
 
 	// Set global logger
 	logger = config.Logger
+
+	// Register types we serialize with gob
+	var t time.Time
+	gob.Register(t)
 
 	// Initialize global variables with environment variables, providing defaults if not set
 	_APP_VERSION = os.Getenv("DBOS__APPVERSION")
@@ -272,4 +245,33 @@ func Shutdown() {
 		logger = nil
 	}
 	dbos = nil
+}
+
+func GetBinaryHash() (string, error) {
+	execPath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+
+	file, err := os.Open(execPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func computeApplicationVersion() string {
+	hash, err := GetBinaryHash()
+	if err != nil {
+		fmt.Printf("DBOS: Failed to compute binary hash: %v\n", err)
+		return ""
+	}
+	return hash
 }

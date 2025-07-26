@@ -1,9 +1,6 @@
 package dbos
 
 import (
-	"context"
-	"encoding/hex"
-	"maps"
 	"testing"
 )
 
@@ -59,29 +56,4 @@ func TestConfigValidationErrorTypes(t *testing.T) {
 			t.Fatalf("expected error message '%s', got '%s'", expectedMsg, dbosErr.Message)
 		}
 	})
-}
-func TestAppVersion(t *testing.T) {
-	if _, err := hex.DecodeString(_APP_VERSION); err != nil {
-		t.Fatalf("APP_VERSION is not a valid hex string: %v", err)
-	}
-
-	// Save the original registry content
-	originalRegistry := make(map[string]workflowRegistryEntry)
-	maps.Copy(originalRegistry, registry)
-
-	// Restore the registry after the test
-	defer func() {
-		registry = originalRegistry
-	}()
-
-	// Replace the registry and verify the hash is different
-	registry = make(map[string]workflowRegistryEntry)
-
-	WithWorkflow(func(ctx context.Context, input string) (string, error) {
-		return "new-registry-workflow-" + input, nil
-	})
-	hash2 := computeApplicationVersion()
-	if _APP_VERSION == hash2 {
-		t.Fatalf("APP_VERSION hash did not change after replacing registry")
-	}
 }

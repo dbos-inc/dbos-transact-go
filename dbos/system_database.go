@@ -38,9 +38,9 @@ type SystemDatabase interface {
 	CheckOperationExecution(ctx context.Context, input checkOperationExecutionDBInput) (*recordedResult, error)
 	RecordChildGetResult(ctx context.Context, input recordChildGetResultDBInput) error
 	GetWorkflowSteps(ctx context.Context, workflowID string) ([]StepInfo, error)
-	Send(ctx context.Context, input WorkflowSendInput) error
+	Send(ctx context.Context, input workflowSendInputInternal) error
 	Recv(ctx context.Context, input WorkflowRecvInput) (any, error)
-	SetEvent(ctx context.Context, input WorkflowSetEventInput) error
+	SetEvent(ctx context.Context, input workflowSetEventInputInternal) error
 	GetEvent(ctx context.Context, input WorkflowGetEventInput) (any, error)
 	Sleep(ctx context.Context, duration time.Duration) (time.Duration, error)
 }
@@ -1102,22 +1102,30 @@ func (s *systemDatabase) notificationListenerLoop(ctx context.Context) {
 
 const _DBOS_NULL_TOPIC = "__null__topic__"
 
+type workflowSendInputInternal struct {
+	destinationID string
+	message       any
+	topic         string
+}
+
 // Send is a special type of step that sends a message to another workflow.
-// Three differences with a normal steps: durability and the function run in the same transaction, and we forbid nested step execution
-func (s *systemDatabase) Send(ctx context.Context, input WorkflowSendInput) error {
+// Can be called both within a workflow (as a step) or outside a workflow (directly).
+// When called within a workflow: durability and the function run in the same transaction, and we forbid nested step execution
+func (s *systemDatabase) Send(ctx context.Context, input workflowSendInputInternal) error {
 	functionName := "DBOS.send"
 
-	// Get workflow state from context
+	// Get workflow state from context (optional for Send as we can send from outside a workflow)
 	wfState, ok := ctx.Value(workflowStateKey).(*workflowState)
-	if !ok || wfState == nil {
-		return newStepExecutionError("", functionName, "workflow state not found in context: are you running this step within a workflow?")
-	}
+	var stepID int
+	var isInWorkflow bool
 
-	if wfState.isWithinStep {
-		return newStepExecutionError(wfState.workflowID, functionName, "cannot call Send within a step")
+	if ok && wfState != nil {
+		isInWorkflow = true
+		if wfState.isWithinStep {
+			return newStepExecutionError(wfState.workflowID, functionName, "cannot call Send within a step")
+		}
+		stepID = wfState.NextStepID()
 	}
-
-	stepID := wfState.NextStepID()
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1125,59 +1133,61 @@ func (s *systemDatabase) Send(ctx context.Context, input WorkflowSendInput) erro
 	}
 	defer tx.Rollback(ctx)
 
-	// Check if operation was already executed and do nothing if so
-	checkInput := checkOperationExecutionDBInput{
-		workflowID: wfState.workflowID,
-		stepID:     stepID,
-		stepName:   functionName,
-		tx:         tx,
-	}
-	recordedResult, err := s.CheckOperationExecution(ctx, checkInput)
-	if err != nil {
-		return err
-	}
-	if recordedResult != nil {
-		// when hitting this case, recordedResult will be &{<nil> <nil>}
-		return nil
+	// Check if operation was already executed and do nothing if so (only if in workflow)
+	if isInWorkflow {
+		checkInput := checkOperationExecutionDBInput{
+			workflowID: wfState.workflowID,
+			stepID:     stepID,
+			stepName:   functionName,
+			tx:         tx,
+		}
+		recordedResult, err := s.CheckOperationExecution(ctx, checkInput)
+		if err != nil {
+			return err
+		}
+		if recordedResult != nil {
+			// when hitting this case, recordedResult will be &{<nil> <nil>}
+			return nil
+		}
 	}
 
 	// Set default topic if not provided
 	topic := _DBOS_NULL_TOPIC
-	if len(input.Topic) > 0 {
-		topic = input.Topic
+	if len(input.topic) > 0 {
+		topic = input.topic
 	}
 
 	// Serialize the message. It must have been registered with encoding/gob by the user if not a basic type.
-	messageString, err := serialize(input.Message)
+	messageString, err := serialize(input.message)
 	if err != nil {
 		return fmt.Errorf("failed to serialize message: %w", err)
 	}
 
-	insertQuery := `INSERT INTO dbos.notifications (destination_uuid, topic, message)
-					VALUES ($1, $2, $3)`
-
-	_, err = tx.Exec(ctx, insertQuery, input.DestinationID, topic, messageString)
+	insertQuery := `INSERT INTO dbos.notifications (destination_uuid, topic, message) VALUES ($1, $2, $3)`
+	_, err = tx.Exec(ctx, insertQuery, input.destinationID, topic, messageString)
 	if err != nil {
 		// Check for foreign key violation (destination workflow doesn't exist)
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23503" {
-			return newNonExistentWorkflowError(input.DestinationID)
+			return newNonExistentWorkflowError(input.destinationID)
 		}
 		return fmt.Errorf("failed to insert notification: %w", err)
 	}
 
-	// Record the operation result
-	recordInput := recordOperationResultDBInput{
-		workflowID: wfState.workflowID,
-		stepID:     stepID,
-		stepName:   functionName,
-		output:     nil,
-		err:        nil,
-		tx:         tx,
-	}
+	// Record the operation result if this is called within a workflow
+	if isInWorkflow {
+		recordInput := recordOperationResultDBInput{
+			workflowID: wfState.workflowID,
+			stepID:     stepID,
+			stepName:   functionName,
+			output:     nil,
+			err:        nil,
+			tx:         tx,
+		}
 
-	err = s.RecordOperationResult(ctx, recordInput)
-	if err != nil {
-		return fmt.Errorf("failed to record operation result: %w", err)
+		err = s.RecordOperationResult(ctx, recordInput)
+		if err != nil {
+			return fmt.Errorf("failed to record operation result: %w", err)
+		}
 	}
 
 	// Commit transaction
@@ -1334,7 +1344,12 @@ func (s *systemDatabase) Recv(ctx context.Context, input WorkflowRecvInput) (any
 	return message, nil
 }
 
-func (s *systemDatabase) SetEvent(ctx context.Context, input WorkflowSetEventInput) error {
+type workflowSetEventInputInternal struct {
+	key     string
+	message any
+}
+
+func (s *systemDatabase) SetEvent(ctx context.Context, input workflowSetEventInputInternal) error {
 	functionName := "DBOS.setEvent"
 
 	// Get workflow state from context
@@ -1372,7 +1387,7 @@ func (s *systemDatabase) SetEvent(ctx context.Context, input WorkflowSetEventInp
 	}
 
 	// Serialize the message. It must have been registered with encoding/gob by the user if not a basic type.
-	messageString, err := serialize(input.Message)
+	messageString, err := serialize(input.message)
 	if err != nil {
 		return fmt.Errorf("failed to serialize message: %w", err)
 	}
@@ -1383,7 +1398,7 @@ func (s *systemDatabase) SetEvent(ctx context.Context, input WorkflowSetEventInp
 					ON CONFLICT (workflow_uuid, key)
 					DO UPDATE SET value = EXCLUDED.value`
 
-	_, err = tx.Exec(ctx, insertQuery, wfState.workflowID, input.Key, messageString)
+	_, err = tx.Exec(ctx, insertQuery, wfState.workflowID, input.key, messageString)
 	if err != nil {
 		return fmt.Errorf("failed to insert/update workflow event: %w", err)
 	}

@@ -973,6 +973,7 @@ var (
 	recvIdempotencyWf            = WithWorkflow(receiveIdempotencyWorkflow)
 	receiveIdempotencyStartEvent = NewEvent()
 	receiveIdempotencyStopEvent  = NewEvent()
+	sendWithinStepWf             = WithWorkflow(workflowThatCallsSendInStep)
 	numConcurrentRecvWfs         = 5
 	concurrentRecvReadyEvents    = make([]*Event, numConcurrentRecvWfs)
 	concurrentRecvStartEvent     = NewEvent()
@@ -984,15 +985,15 @@ type sendWorkflowInput struct {
 }
 
 func sendWorkflow(ctx context.Context, input sendWorkflowInput) (string, error) {
-	err := Send(ctx, WorkflowSendInput{DestinationID: input.DestinationID, Topic: input.Topic, Message: "message1"})
+	err := Send(ctx, WorkflowSendInput[string]{DestinationID: input.DestinationID, Topic: input.Topic, Message: "message1"})
 	if err != nil {
 		return "", err
 	}
-	err = Send(ctx, WorkflowSendInput{DestinationID: input.DestinationID, Topic: input.Topic, Message: "message2"})
+	err = Send(ctx, WorkflowSendInput[string]{DestinationID: input.DestinationID, Topic: input.Topic, Message: "message2"})
 	if err != nil {
 		return "", err
 	}
-	err = Send(ctx, WorkflowSendInput{DestinationID: input.DestinationID, Topic: input.Topic, Message: "message3"})
+	err = Send(ctx, WorkflowSendInput[string]{DestinationID: input.DestinationID, Topic: input.Topic, Message: "message3"})
 	if err != nil {
 		return "", err
 	}
@@ -1036,7 +1037,7 @@ func receiveWorkflowCoordinated(ctx context.Context, input struct {
 
 func sendStructWorkflow(ctx context.Context, input sendWorkflowInput) (string, error) {
 	testStruct := sendRecvType{Value: "test-struct-value"}
-	err := Send(ctx, WorkflowSendInput{DestinationID: input.DestinationID, Topic: input.Topic, Message: testStruct})
+	err := Send(ctx, WorkflowSendInput[sendRecvType]{DestinationID: input.DestinationID, Topic: input.Topic, Message: testStruct})
 	return "", err
 }
 
@@ -1045,7 +1046,7 @@ func receiveStructWorkflow(ctx context.Context, topic string) (sendRecvType, err
 }
 
 func sendIdempotencyWorkflow(ctx context.Context, input sendWorkflowInput) (string, error) {
-	err := Send(ctx, WorkflowSendInput{DestinationID: input.DestinationID, Topic: input.Topic, Message: "m1"})
+	err := Send(ctx, WorkflowSendInput[string]{DestinationID: input.DestinationID, Topic: input.Topic, Message: "m1"})
 	if err != nil {
 		return "", err
 	}
@@ -1061,6 +1062,22 @@ func receiveIdempotencyWorkflow(ctx context.Context, topic string) (string, erro
 	receiveIdempotencyStartEvent.Set()
 	receiveIdempotencyStopEvent.Wait()
 	return msg, nil
+}
+
+func stepThatCallsSend(ctx context.Context, input sendWorkflowInput) (string, error) {
+	err := Send(ctx, WorkflowSendInput[string]{
+		DestinationID: input.DestinationID,
+		Topic:         input.Topic,
+		Message:       "message-from-step",
+	})
+	if err != nil {
+		return "", err
+	}
+	return "send-completed", nil
+}
+
+func workflowThatCallsSendInStep(ctx context.Context, input sendWorkflowInput) (string, error) {
+	return RunAsStep(ctx, stepThatCallsSend, input)
 }
 
 type sendRecvType struct {
@@ -1185,13 +1202,13 @@ func TestSendRecv(t *testing.T) {
 		}
 	})
 
-	t.Run("SendRecvMustRunInsideWorkflows", func(t *testing.T) {
+	t.Run("RecvMustRunInsideWorkflows", func(t *testing.T) {
 		ctx := context.Background()
 
-		// Attempt to run Send outside of a workflow context
-		err := Send(ctx, WorkflowSendInput{DestinationID: "test-id", Topic: "test-topic", Message: "test-message"})
+		// Attempt to run Recv outside of a workflow context
+		_, err := Recv[string](ctx, WorkflowRecvInput{Topic: "test-topic", Timeout: 1 * time.Second})
 		if err == nil {
-			t.Fatal("expected error when running Send outside of workflow context, but got none")
+			t.Fatal("expected error when running Recv outside of workflow context, but got none")
 		}
 
 		// Check the error type
@@ -1209,26 +1226,35 @@ func TestSendRecv(t *testing.T) {
 		if !strings.Contains(err.Error(), expectedMessagePart) {
 			t.Fatalf("expected error message to contain %q, but got %q", expectedMessagePart, err.Error())
 		}
+	})
 
-		// Attempt to run Recv outside of a workflow context
-		_, err = Recv[string](ctx, WorkflowRecvInput{Topic: "test-topic", Timeout: 1 * time.Second})
-		if err == nil {
-			t.Fatal("expected error when running Recv outside of workflow context, but got none")
+	t.Run("SendOutsideWorkflow", func(t *testing.T) {
+		// Start a receive workflow to have a valid destination
+		receiveHandle, err := receiveWf(context.Background(), "outside-workflow-topic")
+		if err != nil {
+			t.Fatalf("failed to start receive workflow: %v", err)
 		}
 
-		// Check the error type
-		dbosErr, ok = err.(*DBOSError)
-		if !ok {
-			t.Fatalf("expected error to be of type *DBOSError, got %T", err)
+		// Send messages from outside a workflow context (should work now)
+		ctx := context.Background()
+		for i := range 3 {
+			err = Send(ctx, WorkflowSendInput[string]{
+				DestinationID: receiveHandle.GetWorkflowID(),
+				Topic:         "outside-workflow-topic",
+				Message:       fmt.Sprintf("message%d", i+1),
+			})
+			if err != nil {
+				t.Fatalf("failed to send message%d from outside workflow: %v", i+1, err)
+			}
 		}
 
-		if dbosErr.Code != StepExecutionError {
-			t.Fatalf("expected error code to be StepExecutionError, got %v", dbosErr.Code)
+		// Verify the receive workflow gets all messages
+		result, err := receiveHandle.GetResult(context.Background())
+		if err != nil {
+			t.Fatalf("failed to get result from receive workflow: %v", err)
 		}
-
-		// Test the specific message from the error
-		if !strings.Contains(err.Error(), expectedMessagePart) {
-			t.Fatalf("expected error message to contain %q, but got %q", expectedMessagePart, err.Error())
+		if result != "message1-message2-message3" {
+			t.Fatalf("expected result to be 'message1-message2-message3', got '%s'", result)
 		}
 	})
 	t.Run("SendRecvIdempotency", func(t *testing.T) {
@@ -1289,6 +1315,54 @@ func TestSendRecv(t *testing.T) {
 		}
 		if result != "idempotent-send-completed" {
 			t.Fatalf("expected result to be 'idempotent-send-completed', got '%s'", result)
+		}
+	})
+
+	t.Run("SendCannotBeCalledWithinStep", func(t *testing.T) {
+		// Start a receive workflow to have a valid destination
+		receiveHandle, err := receiveWf(context.Background(), "send-within-step-topic")
+		if err != nil {
+			t.Fatalf("failed to start receive workflow: %v", err)
+		}
+
+		// Execute the workflow that tries to call Send within a step
+		handle, err := sendWithinStepWf(context.Background(), sendWorkflowInput{
+			DestinationID: receiveHandle.GetWorkflowID(),
+			Topic:         "send-within-step-topic",
+		})
+		if err != nil {
+			t.Fatalf("failed to start workflow: %v", err)
+		}
+
+		// Expect the workflow to fail with the specific error
+		_, err = handle.GetResult(context.Background())
+		if err == nil {
+			t.Fatal("expected error when calling Send within a step, but got none")
+		}
+
+		// Check the error type
+		dbosErr, ok := err.(*DBOSError)
+		if !ok {
+			t.Fatalf("expected error to be of type *DBOSError, got %T", err)
+		}
+
+		if dbosErr.Code != StepExecutionError {
+			t.Fatalf("expected error code to be StepExecutionError, got %v", dbosErr.Code)
+		}
+
+		// Test the specific message from the error
+		expectedMessagePart := "cannot call Send within a step"
+		if !strings.Contains(err.Error(), expectedMessagePart) {
+			t.Fatalf("expected error message to contain %q, but got %q", expectedMessagePart, err.Error())
+		}
+
+		// Wait for the receive workflow to time out
+		result, err := receiveHandle.GetResult(context.Background())
+		if err != nil {
+			t.Fatalf("failed to get result from receive workflow: %v", err)
+		}
+		if result != "--" {
+			t.Fatalf("expected receive workflow result to be '--' (timeout), got '%s'", result)
 		}
 	})
 
@@ -1396,7 +1470,7 @@ type setEventWorkflowInput struct {
 }
 
 func setEventWorkflow(ctx context.Context, input setEventWorkflowInput) (string, error) {
-	err := SetEvent(ctx, WorkflowSetEventInput{Key: input.Key, Message: input.Message})
+	err := SetEvent(ctx, WorkflowSetEventInput[string]{Key: input.Key, Message: input.Message})
 	if err != nil {
 		return "", err
 	}
@@ -1417,7 +1491,7 @@ func getEventWorkflow(ctx context.Context, input setEventWorkflowInput) (string,
 
 func setTwoEventsWorkflow(ctx context.Context, input setEventWorkflowInput) (string, error) {
 	// Set the first event
-	err := SetEvent(ctx, WorkflowSetEventInput{Key: "event1", Message: "first-event-message"})
+	err := SetEvent(ctx, WorkflowSetEventInput[string]{Key: "event1", Message: "first-event-message"})
 	if err != nil {
 		return "", err
 	}
@@ -1426,7 +1500,7 @@ func setTwoEventsWorkflow(ctx context.Context, input setEventWorkflowInput) (str
 	setSecondEventSignal.Wait()
 
 	// Set the second event
-	err = SetEvent(ctx, WorkflowSetEventInput{Key: "event2", Message: "second-event-message"})
+	err = SetEvent(ctx, WorkflowSetEventInput[string]{Key: "event2", Message: "second-event-message"})
 	if err != nil {
 		return "", err
 	}
@@ -1435,7 +1509,7 @@ func setTwoEventsWorkflow(ctx context.Context, input setEventWorkflowInput) (str
 }
 
 func setEventIdempotencyWorkflow(ctx context.Context, input setEventWorkflowInput) (string, error) {
-	err := SetEvent(ctx, WorkflowSetEventInput{Key: input.Key, Message: input.Message})
+	err := SetEvent(ctx, WorkflowSetEventInput[string]{Key: input.Key, Message: input.Message})
 	if err != nil {
 		return "", err
 	}
@@ -1596,7 +1670,7 @@ func TestSetGetEvent(t *testing.T) {
 		ctx := context.Background()
 
 		// Attempt to run SetEvent outside of a workflow context
-		err := SetEvent(ctx, WorkflowSetEventInput{Key: "test-key", Message: "test-message"})
+		err := SetEvent(ctx, WorkflowSetEventInput[string]{Key: "test-key", Message: "test-message"})
 		if err == nil {
 			t.Fatal("expected error when running SetEvent outside of workflow context, but got none")
 		}
