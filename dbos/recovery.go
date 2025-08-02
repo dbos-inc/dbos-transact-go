@@ -1,17 +1,16 @@
 package dbos
 
 import (
-	"context"
 	"strings"
 )
 
-func recoverPendingWorkflows(ctx context.Context, executorIDs []string) ([]WorkflowHandle[any], error) {
+func recoverPendingWorkflows(ctx *dbosContext, executorIDs []string) ([]WorkflowHandle[any], error) {
 	workflowHandles := make([]WorkflowHandle[any], 0)
 	// List pending workflows for the executors
-	pendingWorkflows, err := dbos.systemDB.ListWorkflows(ctx, listWorkflowsDBInput{
+	pendingWorkflows, err := ctx.systemDB.ListWorkflows(ctx, listWorkflowsDBInput{
 		status:             []WorkflowStatusType{WorkflowStatusPending},
 		executorIDs:        executorIDs,
-		applicationVersion: dbos.applicationVersion,
+		applicationVersion: ctx.applicationVersion,
 	})
 	if err != nil {
 		return nil, err
@@ -25,37 +24,29 @@ func recoverPendingWorkflows(ctx context.Context, executorIDs []string) ([]Workf
 			}
 		}
 
-		// fmt.Println("Recovering workflow:", workflow.ID, "Name:", workflow.Name, "Input:", workflow.Input, "QueueName:", workflow.QueueName)
 		if workflow.QueueName != "" {
-			cleared, err := dbos.systemDB.ClearQueueAssignment(ctx, workflow.ID)
+			cleared, err := ctx.systemDB.ClearQueueAssignment(ctx.ctx, workflow.ID)
 			if err != nil {
 				getLogger().Error("Error clearing queue assignment for workflow", "workflow_id", workflow.ID, "name", workflow.Name, "error", err)
 				continue
 			}
 			if cleared {
-				workflowHandles = append(workflowHandles, &workflowPollingHandle[any]{workflowID: workflow.ID})
+				workflowHandles = append(workflowHandles, &workflowPollingHandle[any]{workflowID: workflow.ID, dbosContext: ctx})
 			}
 			continue
 		}
 
-		registeredWorkflow, exists := registry[workflow.Name]
+		registeredWorkflow, exists := ctx.workflowRegistry[workflow.Name]
 		if !exists {
 			getLogger().Error("Workflow function not found in registry", "workflow_id", workflow.ID, "name", workflow.Name)
 			continue
 		}
 
 		// Convert workflow parameters to options
-		opts := []workflowOption{
+		opts := []WorkflowOption{
 			WithWorkflowID(workflow.ID),
 		}
-		// XXX we'll figure out the exact timeout/deadline settings later
-		if workflow.Timeout != 0 {
-			opts = append(opts, WithTimeout(workflow.Timeout))
-		}
-		if !workflow.Deadline.IsZero() {
-			opts = append(opts, WithDeadline(workflow.Deadline))
-		}
-
+		// Create a workflow context from the executor context
 		handle, err := registeredWorkflow.wrappedFunction(ctx, workflow.Input, opts...)
 		if err != nil {
 			return nil, err

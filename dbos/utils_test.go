@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func getDatabaseURL(t *testing.T) string {
+func getDatabaseURL() string {
 	databaseURL := os.Getenv("DBOS_SYSTEM_DATABASE_URL")
 	if databaseURL == "" {
 		password := os.Getenv("PGPASSWORD")
@@ -25,10 +25,10 @@ func getDatabaseURL(t *testing.T) string {
 }
 
 /* Test database setup */
-func setupDBOS(t *testing.T) {
+func setupDBOS(t *testing.T) DBOSContext {
 	t.Helper()
 
-	databaseURL := getDatabaseURL(t)
+	databaseURL := getDatabaseURL()
 
 	// Clean up the test database
 	parsedURL, err := pgx.ParseConfig(databaseURL)
@@ -54,28 +54,26 @@ func setupDBOS(t *testing.T) {
 		t.Fatalf("failed to drop test database: %v", err)
 	}
 
-	err = Initialize(Config{
+	dbosContext, err := NewDBOSContext(Config{
 		DatabaseURL: databaseURL,
 		AppName:     "test-app",
 	})
 	if err != nil {
 		t.Fatalf("failed to create DBOS instance: %v", err)
 	}
-
-	err = Launch()
-	if err != nil {
-		t.Fatalf("failed to launch DBOS instance: %v", err)
-	}
-
-	if dbos == nil {
+	if dbosContext == nil {
 		t.Fatal("expected DBOS instance but got nil")
 	}
 
 	// Register cleanup to run after test completes
 	t.Cleanup(func() {
 		fmt.Println("Cleaning up DBOS instance...")
-		Shutdown()
+		if dbosContext != nil {
+			dbosContext.Shutdown()
+		}
 	})
+
+	return dbosContext
 }
 
 /* Event struct provides a simple synchronization primitive that can be used to signal between goroutines. */
@@ -115,27 +113,32 @@ func (e *Event) Clear() {
 /* Helpers */
 
 // stopQueueRunner stops the queue runner for testing purposes
-func stopQueueRunner() {
-	if dbos != nil && dbos.queueRunnerCancelFunc != nil {
-		dbos.queueRunnerCancelFunc()
-		// Wait for queue runner to finish
-		<-dbos.queueRunnerDone
+func stopQueueRunner(ctx DBOSContext) {
+	if ctx != nil {
+		exec := ctx.(*dbosContext)
+		if exec.queueRunnerCancelFunc != nil {
+			exec.queueRunnerCancelFunc()
+			// Wait for queue runner to finish
+			<-exec.queueRunnerDone
+		}
 	}
 }
 
 // restartQueueRunner restarts the queue runner for testing purposes
-func restartQueueRunner() {
-	if dbos != nil {
+func restartQueueRunner(ctx DBOSContext) {
+	if ctx != nil {
+		exec := ctx.(*dbosContext)
 		// Create new context and cancel function
+		// FIXME: cancellation now has to go through the DBOSContext
 		ctx, cancel := context.WithCancel(context.Background())
-		dbos.queueRunnerCtx = ctx
-		dbos.queueRunnerCancelFunc = cancel
-		dbos.queueRunnerDone = make(chan struct{})
+		exec.queueRunnerCtx = ctx
+		exec.queueRunnerCancelFunc = cancel
+		exec.queueRunnerDone = make(chan struct{})
 
 		// Start the queue runner in a goroutine
 		go func() {
-			defer close(dbos.queueRunnerDone)
-			queueRunner(ctx)
+			defer close(exec.queueRunnerDone)
+			queueRunner(exec)
 		}()
 	}
 }
@@ -152,12 +155,13 @@ func equal(a, b []int) bool {
 	return true
 }
 
-func queueEntriesAreCleanedUp() bool {
+func queueEntriesAreCleanedUp(ctx DBOSContext) bool {
 	maxTries := 10
 	success := false
 	for range maxTries {
 		// Begin transaction
-		tx, err := dbos.systemDB.(*systemDatabase).pool.Begin(context.Background())
+		exec := ctx.(*dbosContext)
+		tx, err := exec.systemDB.(*systemDatabase).pool.Begin(context.Background())
 		if err != nil {
 			return false
 		}

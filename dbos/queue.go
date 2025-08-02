@@ -2,7 +2,6 @@ package dbos
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/gob"
 	"math"
@@ -73,10 +72,7 @@ func WithMaxTasksPerIteration(maxTasks int) queueOption {
 
 // NewWorkflowQueue creates a new workflow queue with optional configuration
 func NewWorkflowQueue(name string, options ...queueOption) WorkflowQueue {
-	if dbos != nil {
-		getLogger().Warn("NewWorkflowQueue called after DBOS initialization, dynamic registration is not supported")
-		return WorkflowQueue{}
-	}
+	// TODO: Add runtime check for post-initialization registration if needed
 	if _, exists := workflowQueueRegistry[name]; exists {
 		panic(newConflictingRegistrationError(name))
 	}
@@ -102,7 +98,7 @@ func NewWorkflowQueue(name string, options ...queueOption) WorkflowQueue {
 	return q
 }
 
-func queueRunner(ctx context.Context) {
+func queueRunner(ctx *dbosContext) {
 	const (
 		baseInterval    = 1.0   // Base interval in seconds
 		minInterval     = 1.0   // Minimum polling interval in seconds
@@ -122,7 +118,7 @@ func queueRunner(ctx context.Context) {
 		for queueName, queue := range workflowQueueRegistry {
 			getLogger().Debug("Processing queue", "queue_name", queueName)
 			// Call DequeueWorkflows for each queue
-			dequeuedWorkflows, err := dbos.systemDB.DequeueWorkflows(ctx, queue)
+			dequeuedWorkflows, err := ctx.systemDB.DequeueWorkflows(ctx.queueRunnerCtx, queue, ctx.executorID, ctx.applicationVersion)
 			if err != nil {
 				if pgErr, ok := err.(*pgconn.PgError); ok {
 					switch pgErr.Code {
@@ -143,7 +139,7 @@ func queueRunner(ctx context.Context) {
 			}
 			for _, workflow := range dequeuedWorkflows {
 				// Find the workflow in the registry
-				registeredWorkflow, exists := registry[workflow.name]
+				registeredWorkflow, exists := ctx.workflowRegistry[workflow.name]
 				if !exists {
 					getLogger().Error("workflow function not found in registry", "workflow_name", workflow.name)
 					continue
@@ -165,6 +161,7 @@ func queueRunner(ctx context.Context) {
 					}
 				}
 
+				// XXX this demonstrate why contexts cannot be used globally -- the task does not inherit the context used in the program that enqueued it
 				_, err := registeredWorkflow.wrappedFunction(ctx, input, WithWorkflowID(workflow.id))
 				if err != nil {
 					getLogger().Error("Error running queued workflow", "error", err)
@@ -187,7 +184,7 @@ func queueRunner(ctx context.Context) {
 
 		// Sleep with jittered interval, but allow early exit on context cancellation
 		select {
-		case <-ctx.Done():
+		case <-ctx.queueRunnerCtx.Done():
 			getLogger().Info("Queue runner stopping due to context cancellation")
 			return
 		case <-time.After(sleepDuration):

@@ -19,12 +19,10 @@ var (
 	_DEFAULT_ADMIN_SERVER_PORT = 3001
 )
 
-var workflowScheduler *cron.Cron // Global because accessed during workflow registration before the dbos singleton is initialized
-
 var logger *slog.Logger // Global because accessed everywhere inside the library
 
 func getLogger() *slog.Logger {
-	if dbos == nil || logger == nil {
+	if logger == nil {
 		return slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	return logger
@@ -62,35 +60,133 @@ func processConfig(inputConfig *Config) (*Config, error) {
 	return dbosConfig, nil
 }
 
-var dbos *executor // DBOS singleton instance
+type DBOSContext interface {
+	context.Context
 
-type executor struct {
-	systemDB              SystemDatabase
+	// Context Lifecycle
+	Launch() error
+	Shutdown()
+
+	// Workflow operations
+	RunAsStep(_ DBOSContext, fn StepFunc, input any) (any, error)
+	RunAsWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opts ...WorkflowOption) (WorkflowHandle[any], error)
+	Send(_ DBOSContext, input WorkflowSendInputInternal) error
+	Recv(_ DBOSContext, input WorkflowRecvInput) (any, error)
+	SetEvent(_ DBOSContext, input WorkflowSetEventInput) error
+	GetEvent(_ DBOSContext, input WorkflowGetEventInput) (any, error)
+	Sleep(duration time.Duration) (time.Duration, error)
+	GetWorkflowID() (string, error)
+
+	// Workflow management
+	RetrieveWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error)
+
+	// Accessors
+	GetApplicationVersion() string
+	GetExecutorID() string
+	GetApplicationID() string
+}
+
+type dbosContext struct {
+	ctx context.Context
+
+	launched bool
+
+	systemDB    SystemDatabase
+	adminServer *adminServer
+	config      *Config
+
+	// Queue runner context and cancel function
 	queueRunnerCtx        context.Context
 	queueRunnerCancelFunc context.CancelFunc
 	queueRunnerDone       chan struct{}
-	adminServer           *adminServer
-	config                *Config
-	applicationVersion    string
-	applicationID         string
-	executorID            string
-	workflowsWg           *sync.WaitGroup
+
+	// Application metadata
+	applicationVersion string
+	applicationID      string
+	executorID         string
+
+	// Wait group for workflow goroutines
+	workflowsWg *sync.WaitGroup
+
+	// Workflow registry
+	workflowRegistry map[string]workflowRegistryEntry
+	workflowRegMutex *sync.RWMutex
+
+	// Workflow scheduler
+	workflowScheduler *cron.Cron
 }
 
-func Initialize(inputConfig Config) error {
-	if dbos != nil {
-		fmt.Println("warning: DBOS instance already initialized, skipping re-initialization")
-		return newInitializationError("DBOS already initialized")
+// Implement contex.Context interface methods
+func (c *dbosContext) Deadline() (deadline time.Time, ok bool) {
+	return c.ctx.Deadline()
+}
+
+func (c *dbosContext) Done() <-chan struct{} {
+	return c.ctx.Done()
+}
+
+func (c *dbosContext) Err() error {
+	return c.ctx.Err()
+}
+
+func (c *dbosContext) Value(key any) any {
+	return c.ctx.Value(key)
+}
+
+// Create a new context
+// This is intended for workflow contexts and step contexts
+// Hence we only set the relevant fields
+func WithValue(ctx DBOSContext, key, val any) DBOSContext {
+	if ctx == nil {
+		return nil
+	}
+	// Will do nothing if the concrete type is not dbosContext
+	if dbosCtx, ok := ctx.(*dbosContext); ok {
+		return &dbosContext{
+			ctx:                context.WithValue(dbosCtx.ctx, key, val),
+			systemDB:           dbosCtx.systemDB,
+			workflowsWg:        dbosCtx.workflowsWg,
+			workflowRegistry:   dbosCtx.workflowRegistry,
+			workflowRegMutex:   dbosCtx.workflowRegMutex,
+			applicationVersion: dbosCtx.applicationVersion,
+			executorID:         dbosCtx.executorID,
+			applicationID:      dbosCtx.applicationID,
+		}
+	}
+	return nil
+}
+
+func (c *dbosContext) getWorkflowScheduler() *cron.Cron {
+	if c.workflowScheduler == nil {
+		c.workflowScheduler = cron.New(cron.WithSeconds())
+	}
+	return c.workflowScheduler
+}
+
+func (c *dbosContext) GetApplicationVersion() string {
+	return c.applicationVersion
+}
+
+func (c *dbosContext) GetExecutorID() string {
+	return c.executorID
+}
+
+func (c *dbosContext) GetApplicationID() string {
+	return c.applicationID
+}
+
+func NewDBOSContext(inputConfig Config) (DBOSContext, error) {
+	initExecutor := &dbosContext{
+		workflowsWg:      &sync.WaitGroup{},
+		ctx:              context.Background(),
+		workflowRegistry: make(map[string]workflowRegistryEntry),
+		workflowRegMutex: &sync.RWMutex{},
 	}
 
-	initExecutor := &executor{
-		workflowsWg: &sync.WaitGroup{},
-	}
-
-	// Load & process the configuration
+	// Load and process the configuration
 	config, err := processConfig(&inputConfig)
 	if err != nil {
-		return newInitializationError(err.Error())
+		return nil, newInitializationError(err.Error())
 	}
 	initExecutor.config = config
 
@@ -119,57 +215,56 @@ func Initialize(inputConfig Config) error {
 	// Create the system database
 	systemDB, err := NewSystemDatabase(config.DatabaseURL)
 	if err != nil {
-		return newInitializationError(fmt.Sprintf("failed to create system database: %v", err))
+		return nil, newInitializationError(fmt.Sprintf("failed to create system database: %v", err))
 	}
 	initExecutor.systemDB = systemDB
 	logger.Info("System database initialized")
 
-	// Set the global dbos instance
-	dbos = initExecutor
-
-	return nil
+	return initExecutor, nil
 }
 
-func Launch() error {
-	if dbos == nil {
-		return newInitializationError("DBOS instance not initialized, call Initialize first")
+func (c *dbosContext) Launch() error {
+	if c.launched {
+		return newInitializationError("DBOS is already launched")
 	}
+
 	// Start the system database
-	dbos.systemDB.Launch(context.Background())
+	c.systemDB.Launch(context.Background())
 
 	// Start the admin server if configured
-	if dbos.config.AdminServer {
-		adminServer := newAdminServer(_DEFAULT_ADMIN_SERVER_PORT)
+	if c.config.AdminServer {
+		adminServer := newAdminServer(c, _DEFAULT_ADMIN_SERVER_PORT)
 		err := adminServer.Start()
 		if err != nil {
 			logger.Error("Failed to start admin server", "error", err)
 			return newInitializationError(fmt.Sprintf("failed to start admin server: %v", err))
 		}
 		logger.Info("Admin server started", "port", _DEFAULT_ADMIN_SERVER_PORT)
-		dbos.adminServer = adminServer
+		c.adminServer = adminServer
 	}
 
 	// Create context with cancel function for queue runner
-	ctx, cancel := context.WithCancel(context.Background())
-	dbos.queueRunnerCtx = ctx
-	dbos.queueRunnerCancelFunc = cancel
-	dbos.queueRunnerDone = make(chan struct{})
+	// FIXME: cancellation now has to go through the DBOSContext
+	ctx, cancel := context.WithCancel(c.ctx)
+	c.queueRunnerCtx = ctx
+	c.queueRunnerCancelFunc = cancel
+	c.queueRunnerDone = make(chan struct{})
 
 	// Start the queue runner in a goroutine
 	go func() {
-		defer close(dbos.queueRunnerDone)
-		queueRunner(ctx)
+		defer close(c.queueRunnerDone)
+		queueRunner(c)
 	}()
 	logger.Info("Queue runner started")
 
 	// Start the workflow scheduler if it has been initialized
-	if workflowScheduler != nil {
-		workflowScheduler.Start()
+	if c.workflowScheduler != nil {
+		c.workflowScheduler.Start()
 		logger.Info("Workflow scheduler started")
 	}
 
 	// Run a round of recovery on the local executor
-	recoveryHandles, err := recoverPendingWorkflows(context.Background(), []string{dbos.executorID}) // XXX maybe use the queue runner context here to allow Shutdown to cancel it?
+	recoveryHandles, err := recoverPendingWorkflows(c, []string{c.executorID})
 	if err != nil {
 		return newInitializationError(fmt.Sprintf("failed to recover pending workflows during launch: %v", err))
 	}
@@ -177,29 +272,33 @@ func Launch() error {
 		logger.Info("Recovered pending workflows", "count", len(recoveryHandles))
 	}
 
-	logger.Info("DBOS initialized", "app_version", dbos.applicationVersion, "executor_id", dbos.executorID)
+	logger.Info("DBOS initialized", "app_version", c.applicationVersion, "executor_id", c.executorID)
+	c.launched = true
 	return nil
 }
 
-func Shutdown() {
-	if dbos == nil {
-		fmt.Println("DBOS instance is nil, cannot shutdown")
+func (c *dbosContext) Shutdown() {
+	if !c.launched {
+		logger.Warn("DBOS is not launched, nothing to shutdown")
 		return
 	}
 
-	// XXX is there a way to ensure all workflows goroutine are done before closing?
-	dbos.workflowsWg.Wait()
+	// Wait for all workflows to finish
+	getLogger().Info("Waiting for all workflows to finish")
+	c.workflowsWg.Wait()
 
 	// Cancel the context to stop the queue runner
-	if dbos.queueRunnerCancelFunc != nil {
-		dbos.queueRunnerCancelFunc()
+	if c.queueRunnerCancelFunc != nil {
+		getLogger().Info("Stopping queue runner")
+		c.queueRunnerCancelFunc()
 		// Wait for queue runner to finish
-		<-dbos.queueRunnerDone
+		<-c.queueRunnerDone
 		getLogger().Info("Queue runner stopped")
 	}
 
-	if workflowScheduler != nil {
-		ctx := workflowScheduler.Stop()
+	if c.workflowScheduler != nil {
+		getLogger().Info("Stopping workflow scheduler")
+		ctx := c.workflowScheduler.Stop()
 		// Wait for all running jobs to complete with 5-second timeout
 		timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -212,25 +311,26 @@ func Shutdown() {
 		}
 	}
 
-	if dbos.systemDB != nil {
-		dbos.systemDB.Shutdown()
-		dbos.systemDB = nil
+	if c.systemDB != nil {
+		getLogger().Info("Shutting down system database")
+		c.systemDB.Shutdown()
+		c.systemDB = nil
 	}
 
-	if dbos.adminServer != nil {
-		err := dbos.adminServer.Shutdown()
+	if c.adminServer != nil {
+		getLogger().Info("Shutting down admin server")
+		err := c.adminServer.Shutdown()
 		if err != nil {
 			getLogger().Error("Failed to shutdown admin server", "error", err)
 		} else {
 			getLogger().Info("Admin server shutdown complete")
 		}
-		dbos.adminServer = nil
+		c.adminServer = nil
 	}
 
 	if logger != nil {
 		logger = nil
 	}
-	dbos = nil
 }
 
 func GetBinaryHash() (string, error) {

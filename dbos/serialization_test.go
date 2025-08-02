@@ -17,17 +17,12 @@ import (
 [x] Set/get event with user defined types
 */
 
-var (
-	builtinWf = WithWorkflow(encodingWorkflowBuiltinTypes)
-	structWf  = WithWorkflow(encodingWorkflowStruct)
-)
-
 // Builtin types
 func encodingStepBuiltinTypes(_ context.Context, input int) (int, error) {
 	return input, errors.New("step error")
 }
 
-func encodingWorkflowBuiltinTypes(ctx context.Context, input string) (string, error) {
+func encodingWorkflowBuiltinTypes(ctx DBOSContext, input string) (string, error) {
 	stepResult, err := RunAsStep(ctx, encodingStepBuiltinTypes, 123)
 	return fmt.Sprintf("%d", stepResult), fmt.Errorf("workflow error: %v", err)
 }
@@ -53,7 +48,7 @@ type SimpleStruct struct {
 	B int
 }
 
-func encodingWorkflowStruct(ctx context.Context, input WorkflowInputStruct) (StepOutputStruct, error) {
+func encodingWorkflowStruct(ctx DBOSContext, input WorkflowInputStruct) (StepOutputStruct, error) {
 	return RunAsStep(ctx, encodingStepStruct, StepInputStruct{
 		A: input.A,
 		B: fmt.Sprintf("%d", input.B),
@@ -68,17 +63,21 @@ func encodingStepStruct(ctx context.Context, input StepInputStruct) (StepOutputS
 }
 
 func TestWorkflowEncoding(t *testing.T) {
-	setupDBOS(t)
+	executor := setupDBOS(t)
+
+	// Register workflows with executor
+	RegisterWorkflow(executor, encodingWorkflowBuiltinTypes)
+	RegisterWorkflow(executor, encodingWorkflowStruct)
 
 	t.Run("BuiltinTypes", func(t *testing.T) {
 		// Test a workflow that uses a built-in type (string)
-		directHandle, err := builtinWf(context.Background(), "test")
+		directHandle, err := RunAsWorkflow(executor, encodingWorkflowBuiltinTypes, "test")
 		if err != nil {
 			t.Fatalf("failed to execute workflow: %v", err)
 		}
 
 		// Test result and error from direct handle
-		directHandleResult, err := directHandle.GetResult(context.Background())
+		directHandleResult, err := directHandle.GetResult()
 		if directHandleResult != "123" {
 			t.Fatalf("expected direct handle result to be '123', got %v", directHandleResult)
 		}
@@ -87,11 +86,11 @@ func TestWorkflowEncoding(t *testing.T) {
 		}
 
 		// Test result from polling handle
-		retrieveHandler, err := RetrieveWorkflow[string](directHandle.GetWorkflowID())
+		retrieveHandler, err := RetrieveWorkflow[string](executor.(*dbosContext), directHandle.GetWorkflowID())
 		if err != nil {
 			t.Fatalf("failed to retrieve workflow: %v", err)
 		}
-		retrievedResult, err := retrieveHandler.GetResult(context.Background())
+		retrievedResult, err := retrieveHandler.GetResult()
 		if retrievedResult != "123" {
 			t.Fatalf("expected retrieved result to be '123', got %v", retrievedResult)
 		}
@@ -100,7 +99,7 @@ func TestWorkflowEncoding(t *testing.T) {
 		}
 
 		// Test results from ListWorkflows
-		workflows, err := dbos.systemDB.ListWorkflows(context.Background(), listWorkflowsDBInput{
+		workflows, err := executor.(*dbosContext).systemDB.ListWorkflows(context.Background(), listWorkflowsDBInput{
 			workflowIDs: []string{directHandle.GetWorkflowID()},
 		})
 		if err != nil {
@@ -138,7 +137,7 @@ func TestWorkflowEncoding(t *testing.T) {
 		}
 
 		// Test results from GetWorkflowSteps
-		steps, err := dbos.systemDB.GetWorkflowSteps(context.Background(), directHandle.GetWorkflowID())
+		steps, err := executor.(*dbosContext).systemDB.GetWorkflowSteps(context.Background(), directHandle.GetWorkflowID())
 		if err != nil {
 			t.Fatalf("failed to get workflow steps: %v", err)
 		}
@@ -171,13 +170,13 @@ func TestWorkflowEncoding(t *testing.T) {
 			B: 456,
 		}
 
-		directHandle, err := structWf(context.Background(), input)
+		directHandle, err := RunAsWorkflow(executor, encodingWorkflowStruct, input)
 		if err != nil {
 			t.Fatalf("failed to execute step workflow: %v", err)
 		}
 
 		// Test result from direct handle
-		directResult, err := directHandle.GetResult(context.Background())
+		directResult, err := directHandle.GetResult()
 		if err != nil {
 			t.Fatalf("expected no error but got: %v", err)
 		}
@@ -195,11 +194,11 @@ func TestWorkflowEncoding(t *testing.T) {
 		}
 
 		// Test result from polling handle
-		retrieveHandler, err := RetrieveWorkflow[StepOutputStruct](directHandle.GetWorkflowID())
+		retrieveHandler, err := RetrieveWorkflow[StepOutputStruct](executor.(*dbosContext), directHandle.GetWorkflowID())
 		if err != nil {
 			t.Fatalf("failed to retrieve step workflow: %v", err)
 		}
-		retrievedResult, err := retrieveHandler.GetResult(context.Background())
+		retrievedResult, err := retrieveHandler.GetResult()
 		if err != nil {
 			t.Fatalf("expected no error but got: %v", err)
 		}
@@ -217,7 +216,7 @@ func TestWorkflowEncoding(t *testing.T) {
 		}
 
 		// Test results from ListWorkflows
-		workflows, err := dbos.systemDB.ListWorkflows(context.Background(), listWorkflowsDBInput{
+		workflows, err := executor.(*dbosContext).systemDB.ListWorkflows(context.Background(), listWorkflowsDBInput{
 			workflowIDs: []string{directHandle.GetWorkflowID()},
 		})
 		if err != nil {
@@ -259,7 +258,7 @@ func TestWorkflowEncoding(t *testing.T) {
 		}
 
 		// Test results from GetWorkflowSteps
-		steps, err := dbos.systemDB.GetWorkflowSteps(context.Background(), directHandle.GetWorkflowID())
+		steps, err := executor.(*dbosContext).systemDB.GetWorkflowSteps(context.Background(), directHandle.GetWorkflowID())
 		if err != nil {
 			t.Fatalf("failed to get workflow steps: %v", err)
 		}
@@ -301,7 +300,7 @@ type UserDefinedEventData struct {
 	} `json:"details"`
 }
 
-func setEventUserDefinedTypeWorkflow(ctx context.Context, input string) (string, error) {
+func setEventUserDefinedTypeWorkflow(ctx DBOSContext, input string) (string, error) {
 	eventData := UserDefinedEventData{
 		ID:   42,
 		Name: "test-event",
@@ -314,27 +313,28 @@ func setEventUserDefinedTypeWorkflow(ctx context.Context, input string) (string,
 		},
 	}
 
-	err := SetEvent(ctx, WorkflowSetEventInput[UserDefinedEventData]{Key: input, Message: eventData})
+	err := SetEvent(ctx, WorkflowSetEventInputGeneric[UserDefinedEventData]{Key: input, Message: eventData})
 	if err != nil {
 		return "", err
 	}
 	return "user-defined-event-set", nil
 }
 
-var setEventUserDefinedTypeWf = WithWorkflow(setEventUserDefinedTypeWorkflow)
-
 func TestSetEventSerialize(t *testing.T) {
-	setupDBOS(t)
+	executor := setupDBOS(t)
+
+	// Register workflow with executor
+	RegisterWorkflow(executor, setEventUserDefinedTypeWorkflow)
 
 	t.Run("SetEventUserDefinedType", func(t *testing.T) {
 		// Start a workflow that sets an event with a user-defined type
-		setHandle, err := setEventUserDefinedTypeWf(context.Background(), "user-defined-key")
+		setHandle, err := RunAsWorkflow(executor, setEventUserDefinedTypeWorkflow, "user-defined-key")
 		if err != nil {
 			t.Fatalf("failed to start workflow with user-defined event type: %v", err)
 		}
 
 		// Wait for the workflow to complete
-		result, err := setHandle.GetResult(context.Background())
+		result, err := setHandle.GetResult()
 		if err != nil {
 			t.Fatalf("failed to get result from user-defined event workflow: %v", err)
 		}
@@ -343,7 +343,7 @@ func TestSetEventSerialize(t *testing.T) {
 		}
 
 		// Retrieve the event to verify it was properly serialized and can be deserialized
-		retrievedEvent, err := GetEvent[UserDefinedEventData](context.Background(), WorkflowGetEventInput{
+		retrievedEvent, err := GetEvent[UserDefinedEventData](executor, WorkflowGetEventInput{
 			TargetWorkflowID: setHandle.GetWorkflowID(),
 			Key:              "user-defined-key",
 			Timeout:          3 * time.Second,
@@ -374,8 +374,7 @@ func TestSetEventSerialize(t *testing.T) {
 	})
 }
 
-
-func sendUserDefinedTypeWorkflow(ctx context.Context, destinationID string) (string, error) {
+func sendUserDefinedTypeWorkflow(ctx DBOSContext, destinationID string) (string, error) {
 	// Create an instance of our user-defined type inside the workflow
 	sendData := UserDefinedEventData{
 		ID:   42,
@@ -402,7 +401,7 @@ func sendUserDefinedTypeWorkflow(ctx context.Context, destinationID string) (str
 	return "user-defined-message-sent", nil
 }
 
-func recvUserDefinedTypeWorkflow(ctx context.Context, input string) (UserDefinedEventData, error) {
+func recvUserDefinedTypeWorkflow(ctx DBOSContext, input string) (UserDefinedEventData, error) {
 	// Receive the user-defined type message
 	result, err := Recv[UserDefinedEventData](ctx, WorkflowRecvInput{
 		Topic:   "user-defined-topic",
@@ -411,27 +410,28 @@ func recvUserDefinedTypeWorkflow(ctx context.Context, input string) (UserDefined
 	return result, err
 }
 
-var sendUserDefinedTypeWf = WithWorkflow(sendUserDefinedTypeWorkflow)
-var recvUserDefinedTypeWf = WithWorkflow(recvUserDefinedTypeWorkflow)
-
 func TestSendSerialize(t *testing.T) {
-	setupDBOS(t)
+	executor := setupDBOS(t)
+
+	// Register workflows with executor
+	RegisterWorkflow(executor, sendUserDefinedTypeWorkflow)
+	RegisterWorkflow(executor, recvUserDefinedTypeWorkflow)
 
 	t.Run("SendUserDefinedType", func(t *testing.T) {
 		// Start a receiver workflow first
-		recvHandle, err := recvUserDefinedTypeWf(context.Background(), "recv-input")
+		recvHandle, err := RunAsWorkflow(executor, recvUserDefinedTypeWorkflow, "recv-input")
 		if err != nil {
 			t.Fatalf("failed to start receive workflow: %v", err)
 		}
 
 		// Start a sender workflow that sends a message with a user-defined type
-		sendHandle, err := sendUserDefinedTypeWf(context.Background(), recvHandle.GetWorkflowID())
+		sendHandle, err := RunAsWorkflow(executor, sendUserDefinedTypeWorkflow, recvHandle.GetWorkflowID())
 		if err != nil {
 			t.Fatalf("failed to start workflow with user-defined send type: %v", err)
 		}
 
 		// Wait for the sender workflow to complete
-		sendResult, err := sendHandle.GetResult(context.Background())
+		sendResult, err := sendHandle.GetResult()
 		if err != nil {
 			t.Fatalf("failed to get result from user-defined send workflow: %v", err)
 		}
@@ -440,7 +440,7 @@ func TestSendSerialize(t *testing.T) {
 		}
 
 		// Wait for the receiver workflow to complete and get the message
-		receivedData, err := recvHandle.GetResult(context.Background())
+		receivedData, err := recvHandle.GetResult()
 		if err != nil {
 			t.Fatalf("failed to get result from receive workflow: %v", err)
 		}
