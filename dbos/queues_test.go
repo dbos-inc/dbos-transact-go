@@ -30,7 +30,7 @@ This suite tests
 */
 
 func queueWorkflow(ctx DBOSContext, input string) (string, error) {
-	step1, err := RunAsStep(ctx, queueStep, input)
+	step1, err := RunAsStep[string](ctx, queueStep, input)
 	if err != nil {
 		return "", fmt.Errorf("failed to run step: %v", err)
 	}

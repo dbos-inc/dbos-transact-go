@@ -23,7 +23,7 @@ func encodingStepBuiltinTypes(_ context.Context, input int) (int, error) {
 }
 
 func encodingWorkflowBuiltinTypes(ctx DBOSContext, input string) (string, error) {
-	stepResult, err := RunAsStep(ctx, encodingStepBuiltinTypes, 123)
+	stepResult, err := RunAsStep[int](ctx, encodingStepBuiltinTypes, 123)
 	return fmt.Sprintf("%d", stepResult), fmt.Errorf("workflow error: %v", err)
 }
 
@@ -49,7 +49,7 @@ type SimpleStruct struct {
 }
 
 func encodingWorkflowStruct(ctx DBOSContext, input WorkflowInputStruct) (StepOutputStruct, error) {
-	return RunAsStep(ctx, encodingStepStruct, StepInputStruct{
+	return RunAsStep[StepOutputStruct](ctx, encodingStepStruct, StepInputStruct{
 		A: input.A,
 		B: fmt.Sprintf("%d", input.B),
 	})
