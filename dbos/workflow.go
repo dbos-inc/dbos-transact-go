@@ -684,8 +684,8 @@ func (c *dbosContext) RunAsWorkflow(_ DBOSContext, fn WorkflowFunc, input any, o
 /******* STEP FUNCTIONS *******/
 /******************************/
 
-type StepFunc func(ctx context.Context, input any) (any, error)
-type GenericStepFunc[P any, R any] func(ctx context.Context, input P) (R, error)
+type StepFunc func(ctx context.Context) (any, error)
+type GenericStepFunc[R any] func(ctx context.Context) (R, error)
 
 const StepParamsKey DBOSContextKey = "stepParams"
 
@@ -729,7 +729,7 @@ func setStepParamDefaults(params *StepParams, stepName string) *StepParams {
 
 var typeErasedStepNameToStepName = make(map[string]string)
 
-func RunAsStep[P any, R any](ctx DBOSContext, fn GenericStepFunc[P, R], input P) (R, error) {
+func RunAsStep[R any](ctx DBOSContext, fn GenericStepFunc[R]) (R, error) {
 	if ctx == nil {
 		return *new(R), newStepExecutionError("", "", "ctx cannot be nil")
 	}
@@ -738,37 +738,27 @@ func RunAsStep[P any, R any](ctx DBOSContext, fn GenericStepFunc[P, R], input P)
 		return *new(R), newStepExecutionError("", "", "step function cannot be nil")
 	}
 
-	// Type-erase the function based on its actual type
-	typeErasedFn := StepFunc(func(ctx context.Context, input any) (any, error) {
-		typedInput, ok := input.(P)
-		if !ok {
-			return nil, newStepExecutionError("", "", fmt.Sprintf("unexpected input type: expected %T, got %T", *new(P), input))
-		}
-		return fn(ctx, typedInput)
-	})
+	stepName := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
 
-	typeErasedStepNameToStepName[runtime.FuncForPC(reflect.ValueOf(typeErasedFn).Pointer()).Name()] = runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+	// Type-erase the function
+	typeErasedFn := StepFunc(func(ctx context.Context) (any, error) { return fn(ctx) })
+	typeErasedStepNameToStepName[runtime.FuncForPC(reflect.ValueOf(typeErasedFn).Pointer()).Name()] = stepName
 
-	// Call the executor method
-	result, err := ctx.RunAsStep(ctx, typeErasedFn, input)
-	if err != nil {
-		// In case the errors comes from the DBOS step logic, the result will be nil and we must handle it
-		if result == nil {
-			return *new(R), err
-		}
-		return result.(R), err
+	// Call the executor method and pass through the result/error
+	result, err := ctx.RunAsStep(ctx, typeErasedFn)
+	// Step function could return a nil result
+	if result == nil {
+		return *new(R), err
 	}
-
-	// Type-check and cast the result
+	// Otherwise type-check and cast the result
 	typedResult, ok := result.(R)
 	if !ok {
 		return *new(R), fmt.Errorf("unexpected result type: expected %T, got %T", *new(R), result)
 	}
-
-	return typedResult, nil
+	return typedResult, err
 }
 
-func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc, input any) (any, error) {
+func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc) (any, error) {
 	// Get workflow state from context
 	wfState, ok := c.Value(workflowStateKey).(*workflowState)
 	if !ok || wfState == nil {
@@ -776,8 +766,8 @@ func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc, input any) (any, err
 		return nil, newStepExecutionError("", "", "workflow state not found in context: are you running this step within a workflow?")
 	}
 
+	// This should not happen when called from the package-level RunAsStep
 	if fn == nil {
-		// TODO: try to print step name
 		return nil, newStepExecutionError(wfState.workflowID, "", "step function cannot be nil")
 	}
 
@@ -790,7 +780,7 @@ func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc, input any) (any, err
 
 	// If within a step, just run the function directly
 	if wfState.isWithinStep {
-		return fn(c, input)
+		return fn(c)
 	}
 
 	// Setup step state
@@ -819,7 +809,7 @@ func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc, input any) (any, err
 	// Spawn a child DBOSContext with the step state
 	stepCtx := WithValue(c, workflowStateKey, &stepState)
 
-	stepOutput, stepError := fn(stepCtx, input)
+	stepOutput, stepError := fn(stepCtx)
 
 	// Retry if MaxRetries > 0 and the first execution failed
 	var joinedErrors error
@@ -845,7 +835,7 @@ func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc, input any) (any, err
 			}
 
 			// Execute the retry
-			stepOutput, stepError = fn(stepCtx, input)
+			stepOutput, stepError = fn(stepCtx)
 
 			// If successful, break
 			if stepError == nil {

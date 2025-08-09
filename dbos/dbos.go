@@ -61,7 +61,7 @@ type DBOSContext interface {
 	Cancel()
 
 	// Workflow operations
-	RunAsStep(_ DBOSContext, fn StepFunc, input any) (any, error)
+	RunAsStep(_ DBOSContext, fn StepFunc) (any, error)
 	RunAsWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opts ...WorkflowOption) (WorkflowHandle[any], error)
 	Send(_ DBOSContext, input WorkflowSendInputInternal) error
 	Recv(_ DBOSContext, input WorkflowRecvInput) (any, error)
