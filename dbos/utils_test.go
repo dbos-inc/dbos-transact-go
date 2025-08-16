@@ -26,11 +26,9 @@ func getDatabaseURL() string {
 	return databaseURL
 }
 
-/* Test database setup */
-func setupDBOS(t *testing.T, dropDB bool, checkLeaks bool) DBOSContext {
+/* Test database reset */
+func resetTestDatabase(t *testing.T, databaseURL string) {
 	t.Helper()
-
-	databaseURL := getDatabaseURL()
 
 	// Clean up the test database
 	parsedURL, err := pgx.ParseConfig(databaseURL)
@@ -47,9 +45,17 @@ func setupDBOS(t *testing.T, dropDB bool, checkLeaks bool) DBOSContext {
 	require.NoError(t, err)
 	defer conn.Close(context.Background())
 
+	_, err = conn.Exec(context.Background(), "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)")
+	require.NoError(t, err)
+}
+
+/* Test database setup */
+func setupDBOS(t *testing.T, dropDB bool, checkLeaks bool) DBOSContext {
+	t.Helper()
+
+	databaseURL := getDatabaseURL()
 	if dropDB {
-		_, err = conn.Exec(context.Background(), "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)")
-		require.NoError(t, err)
+		resetTestDatabase(t, databaseURL)
 	}
 
 	dbosCtx, err := NewDBOSContext(Config{

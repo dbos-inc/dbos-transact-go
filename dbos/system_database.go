@@ -1227,7 +1227,8 @@ type stepInfo struct {
 func (s *sysDB) getWorkflowSteps(ctx context.Context, workflowID string) ([]stepInfo, error) {
 	query := `SELECT function_id, function_name, output, error, child_workflow_id
 			  FROM dbos.operation_outputs
-			  WHERE workflow_uuid = $1`
+			  WHERE workflow_uuid = $1
+			  ORDER BY function_id ASC`
 
 	rows, err := s.pool.Query(ctx, query, workflowID)
 	if err != nil {
