@@ -22,7 +22,7 @@ func TestConfigValidationErrorTypes(t *testing.T) {
 		require.NoError(t, err)
 		defer func() {
 			if ctx != nil {
-				ctx.Shutdown(1*time.Minute)
+				ctx.Shutdown(1 * time.Minute)
 			}
 		}() // Clean up executor
 

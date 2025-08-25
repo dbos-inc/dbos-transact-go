@@ -243,7 +243,7 @@ func newSystemDatabase(ctx context.Context, databaseURL string, logger *slog.Log
 		notificationListenerConnection: notificationListenerConnection,
 		notificationsMap:               notificationsMap,
 		notificationLoopDone:           make(chan struct{}),
-		logger:                         logger,
+		logger:                         logger.With("service", "system_database"),
 	}, nil
 }
 

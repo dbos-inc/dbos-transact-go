@@ -1728,6 +1728,7 @@ type ListWorkflowsOptions struct {
 	loadInput        bool
 	loadOutput       bool
 	queueName        string
+	executorIDs      []string
 }
 
 // ListWorkflowsOption is a functional option for configuring workflow listing parameters.
@@ -1903,6 +1904,18 @@ func WithQueueName(queueName string) ListWorkflowsOption {
 	}
 }
 
+// WithExecutorIDs filters workflows by the specified executor IDs.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithExecutorIDs([]string{"executor-123", "executor-456"}))
+func WithExecutorIDs(executorIDs []string) ListWorkflowsOption {
+	return func(p *ListWorkflowsOptions) {
+		p.executorIDs = executorIDs
+	}
+}
+
 // ListWorkflows retrieves a list of workflows based on the provided filters.
 //
 // The function supports filtering by workflow IDs, status, time ranges, names, application versions,
@@ -1976,6 +1989,7 @@ func (c *dbosContext) ListWorkflows(_ DBOSContext, opts ...ListWorkflowsOption) 
 		loadInput:          params.loadInput,
 		loadOutput:         params.loadOutput,
 		queueName:          params.queueName,
+		executorIDs:        params.executorIDs,
 	}
 
 	// Call the context method to list workflows

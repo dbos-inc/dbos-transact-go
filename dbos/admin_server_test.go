@@ -34,9 +34,6 @@ func TestAdminServer(t *testing.T) {
 			}
 		}()
 
-		// Give time for any startup processes
-		time.Sleep(100 * time.Millisecond)
-
 		// Verify admin server is not running
 		client := &http.Client{Timeout: 1 * time.Second}
 		_, err = client.Get(fmt.Sprintf("http://localhost:3001/%s", strings.TrimPrefix(_HEALTHCHECK_PATTERN, "GET /")))

@@ -20,20 +20,24 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
 const (
 	_DEFAULT_ADMIN_SERVER_PORT = 3001
+	_DBOS_DOMAIN               = "cloud.dbos.dev"
 )
 
 // Config holds configuration parameters for initializing a DBOS context.
 // DatabaseURL and AppName are required.
 type Config struct {
-	DatabaseURL string       // PostgreSQL connection string (required)
-	AppName     string       // Application name for identification (required)
-	Logger      *slog.Logger // Custom logger instance (defaults to a new slog logger)
-	AdminServer bool         // Enable Transact admin HTTP server
+	DatabaseURL     string       // PostgreSQL connection string (required)
+	AppName         string       // Application name for identification (required)
+	Logger          *slog.Logger // Custom logger instance (defaults to a new slog logger)
+	AdminServer     bool         // Enable Transact admin HTTP server (disabled by default)
+	ConductorURL    string       // DBOS conductor service URL (optional)
+	ConductorAPIKey string       // DBOS conductor API key (optional)
 }
 
 // processConfig enforces mandatory fields and applies defaults.
@@ -47,10 +51,12 @@ func processConfig(inputConfig *Config) (*Config, error) {
 	}
 
 	dbosConfig := &Config{
-		DatabaseURL: inputConfig.DatabaseURL,
-		AppName:     inputConfig.AppName,
-		Logger:      inputConfig.Logger,
-		AdminServer: inputConfig.AdminServer,
+		DatabaseURL:     inputConfig.DatabaseURL,
+		AppName:         inputConfig.AppName,
+		Logger:          inputConfig.Logger,
+		AdminServer:     inputConfig.AdminServer,
+		ConductorURL:    inputConfig.ConductorURL,
+		ConductorAPIKey: inputConfig.ConductorAPIKey,
 	}
 
 	// Load defaults
@@ -111,6 +117,9 @@ type dbosContext struct {
 
 	// Queue runner
 	queueRunner *queueRunner
+
+	// Conductor client
+	conductor *Conductor
 
 	// Application metadata
 	applicationVersion string
@@ -277,6 +286,7 @@ func NewDBOSContext(inputConfig Config) (DBOSContext, error) {
 
 	// Set global logger
 	initExecutor.logger = config.Logger
+	initExecutor.logger.Info("Initializing DBOS context", "app_name", config.AppName)
 
 	// Register types we serialize with gob
 	var t time.Time
@@ -286,22 +296,14 @@ func NewDBOSContext(inputConfig Config) (DBOSContext, error) {
 	initExecutor.applicationVersion = os.Getenv("DBOS__APPVERSION")
 	if initExecutor.applicationVersion == "" {
 		initExecutor.applicationVersion = computeApplicationVersion()
-		initExecutor.logger.Info("DBOS__APPVERSION not set, using computed hash")
 	}
 
 	initExecutor.executorID = os.Getenv("DBOS__VMID")
 	if initExecutor.executorID == "" {
 		initExecutor.executorID = "local"
-		initExecutor.logger.Info("DBOS__VMID not set, using default", "executor_id", initExecutor.executorID)
 	}
 
 	initExecutor.applicationID = os.Getenv("DBOS__APPID")
-
-	initExecutor.logger = initExecutor.logger.With(
-		//"app_version", initExecutor.applicationVersion, // This is really verbose...
-		"executor_id", initExecutor.executorID,
-		//"app_id", initExecutor.applicationID, // This should stay internal
-	)
 
 	// Create the system database
 	systemDB, err := newSystemDatabase(initExecutor, config.DatabaseURL, initExecutor.logger)
@@ -312,8 +314,35 @@ func NewDBOSContext(inputConfig Config) (DBOSContext, error) {
 	initExecutor.logger.Info("System database initialized")
 
 	// Initialize the queue runner and register DBOS internal queue
-	initExecutor.queueRunner = newQueueRunner()
+	initExecutor.queueRunner = newQueueRunner(initExecutor.logger)
 	NewWorkflowQueue(initExecutor, _DBOS_INTERNAL_QUEUE_NAME)
+
+	// Initialize conductor if API key is provided
+	if config.ConductorAPIKey != "" {
+		if initExecutor.executorID == "local" {
+			initExecutor.executorID = uuid.NewString()
+		}
+
+		if config.ConductorURL == "" {
+			dbosDomain := os.Getenv("DBOS_DOMAIN")
+			if dbosDomain == "" {
+				dbosDomain = _DBOS_DOMAIN
+			}
+			config.ConductorURL = fmt.Sprintf("wss://%s/conductor/v1alpha1", dbosDomain)
+		}
+		conductorConfig := ConductorConfig{
+			url:     config.ConductorURL,
+			apiKey:  config.ConductorAPIKey,
+			appName: config.AppName,
+		}
+		conductor, err := NewConductor(conductorConfig, initExecutor)
+		if err != nil {
+			return nil, newInitializationError(fmt.Sprintf("failed to initialize conductor: %v", err))
+		} else {
+			initExecutor.conductor = conductor
+			initExecutor.logger.Info("Conductor initialized")
+		}
+	}
 
 	return initExecutor, nil
 }
@@ -356,6 +385,12 @@ func (c *dbosContext) Launch() error {
 		c.logger.Info("Workflow scheduler started")
 	}
 
+	// Start the conductor if it has been initialized
+	if c.conductor != nil {
+		c.conductor.Launch()
+		c.logger.Info("Conductor started")
+	}
+
 	// Run a round of recovery on the local executor
 	recoveryHandles, err := recoverPendingWorkflows(c, []string{c.executorID})
 	if err != nil {
@@ -379,8 +414,9 @@ func (c *dbosContext) Launch() error {
 // 2. Waits for the queue runner to complete processing
 // 3. Stops the workflow scheduler and waits for scheduled jobs to finish
 // 4. Shuts down the system database connection pool and notification listener
-// 5. Shuts down the admin server
-// 6. Marks the context as not launched
+// 5. Shuts down conductor
+// 6. Shuts down the admin server
+// 7. Marks the context as not launched
 //
 // Each step respects the provided timeout. If any component doesn't shut down within the timeout,
 // a warning is logged and the shutdown continues to the next component.
@@ -413,7 +449,6 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 		select {
 		case <-c.queueRunner.completionChan:
 			c.logger.Info("Queue runner completed")
-			c.queueRunner = nil
 		case <-time.After(timeout):
 			c.logger.Warn("Timeout waiting for queue runner to complete", "timeout", timeout)
 		}
@@ -433,6 +468,12 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 		}
 	}
 
+	// Shutdown the conductor
+	if c.conductor != nil {
+		c.logger.Info("Shutting down conductor")
+		c.conductor.Shutdown(timeout)
+	}
+
 	// Shutdown the admin server
 	if c.adminServer != nil && c.launched.Load() {
 		c.logger.Info("Shutting down admin server")
@@ -442,14 +483,12 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 		} else {
 			c.logger.Info("Admin server shutdown complete")
 		}
-		c.adminServer = nil
 	}
 
 	// Close the system database
 	if c.systemDB != nil {
 		c.logger.Info("Shutting down system database")
 		c.systemDB.shutdown(c, timeout)
-		c.systemDB = nil
 	}
 
 	c.launched.Store(false)

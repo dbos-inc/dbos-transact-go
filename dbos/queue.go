@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/gob"
+	"log/slog"
 	"math"
 	"math/rand"
 	"time"
@@ -132,6 +133,8 @@ func NewWorkflowQueue(dbosCtx DBOSContext, name string, options ...QueueOption) 
 }
 
 type queueRunner struct {
+	logger *slog.Logger
+
 	// Queue runner iteration parameters
 	baseInterval    float64
 	minInterval     float64
@@ -148,7 +151,7 @@ type queueRunner struct {
 	completionChan chan struct{}
 }
 
-func newQueueRunner() *queueRunner {
+func newQueueRunner(logger *slog.Logger) *queueRunner {
 	return &queueRunner{
 		baseInterval:          1.0,
 		minInterval:           1.0,
@@ -159,6 +162,7 @@ func newQueueRunner() *queueRunner {
 		jitterMax:             1.05,
 		workflowQueueRegistry: make(map[string]WorkflowQueue),
 		completionChan:        make(chan struct{}, 1),
+		logger:                logger.With("service", "queue_runner"),
 	}
 }
 
@@ -193,31 +197,31 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 						hasBackoffError = true
 					}
 				} else {
-					ctx.logger.Error("Error dequeuing workflows from queue", "queue_name", queueName, "error", err)
+					qr.logger.Error("Error dequeuing workflows from queue", "queue_name", queueName, "error", err)
 				}
 				continue
 			}
 
 			if len(dequeuedWorkflows) > 0 {
-				ctx.logger.Debug("Dequeued workflows from queue", "queue_name", queueName, "workflows", dequeuedWorkflows)
+				qr.logger.Debug("Dequeued workflows from queue", "queue_name", queueName, "workflows", dequeuedWorkflows)
 			}
 			for _, workflow := range dequeuedWorkflows {
 				// Find the workflow in the registry
 
 				wfName, ok := ctx.workflowCustomNametoFQN.Load(workflow.name)
 				if !ok {
-					ctx.logger.Error("Workflow not found in registry", "workflow_name", workflow.name)
+					qr.logger.Error("Workflow not found in registry", "workflow_name", workflow.name)
 					continue
 				}
 
 				registeredWorkflowAny, exists := ctx.workflowRegistry.Load(wfName.(string))
 				if !exists {
-					ctx.logger.Error("workflow function not found in registry", "workflow_name", workflow.name)
+					qr.logger.Error("workflow function not found in registry", "workflow_name", workflow.name)
 					continue
 				}
 				registeredWorkflow, ok := registeredWorkflowAny.(workflowRegistryEntry)
 				if !ok {
-					ctx.logger.Error("invalid workflow registry entry type", "workflow_name", workflow.name)
+					qr.logger.Error("invalid workflow registry entry type", "workflow_name", workflow.name)
 					continue
 				}
 
@@ -226,20 +230,20 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 				if len(workflow.input) > 0 {
 					inputBytes, err := base64.StdEncoding.DecodeString(workflow.input)
 					if err != nil {
-						ctx.logger.Error("failed to decode input for workflow", "workflow_id", workflow.id, "error", err)
+						qr.logger.Error("failed to decode input for workflow", "workflow_id", workflow.id, "error", err)
 						continue
 					}
 					buf := bytes.NewBuffer(inputBytes)
 					dec := gob.NewDecoder(buf)
 					if err := dec.Decode(&input); err != nil {
-						ctx.logger.Error("failed to decode input for workflow", "workflow_id", workflow.id, "error", err)
+						qr.logger.Error("failed to decode input for workflow", "workflow_id", workflow.id, "error", err)
 						continue
 					}
 				}
 
 				_, err := registeredWorkflow.wrappedFunction(ctx, input, WithWorkflowID(workflow.id))
 				if err != nil {
-					ctx.logger.Error("Error running queued workflow", "error", err)
+					qr.logger.Error("Error running queued workflow", "error", err)
 				}
 			}
 		}
@@ -260,7 +264,7 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 		// Sleep with jittered interval, but allow early exit on context cancellation
 		select {
 		case <-ctx.Done():
-			ctx.logger.Info("Queue runner stopping due to context cancellation", "cause", context.Cause(ctx))
+			qr.logger.Info("Queue runner stopping due to context cancellation", "cause", context.Cause(ctx))
 			qr.completionChan <- struct{}{}
 			return
 		case <-time.After(sleepDuration):

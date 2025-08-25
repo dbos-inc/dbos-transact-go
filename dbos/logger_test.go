@@ -23,7 +23,7 @@ func TestLogger(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() {
 			if dbosCtx != nil {
-				dbosCtx.Shutdown(10*time.Second)
+				dbosCtx.Shutdown(10 * time.Second)
 			}
 		})
 
@@ -56,7 +56,7 @@ func TestLogger(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() {
 			if dbosCtx != nil {
-				dbosCtx.Shutdown(10*time.Second)
+				dbosCtx.Shutdown(10 * time.Second)
 			}
 		})
 
